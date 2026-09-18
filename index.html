@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Asistente Visual en Vivo</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 24px 16px;
+      background-color: #121212;
+      color: #ffffff;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    h1 {
+      font-size: 1.4rem;
+      margin: 0;
+    }
+    .status-panel {
+      padding: 14px;
+      background-color: #1e1e1e;
+      border: 1px solid #333;
+      border-radius: 8px;
+      font-size: 1.05rem;
+    }
+    .field-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    label {
+      font-weight: bold;
+      font-size: 1rem;
+    }
+    input, select, button {
+      font-size: 1.1rem;
+      padding: 14px;
+      border-radius: 8px;
+      border: 1px solid #555;
+      background: #222;
+      color: #fff;
+      width: 100%;
+      box-sizing: border-box;
+      min-height: 52px;
+    }
+    button {
+      font-weight: bold;
+      cursor: pointer;
+    }
+    #btn-start {
+      background-color: #1b5e20;
+      border-color: #2e7d32;
+    }
+    #btn-stop {
+      background-color: #b71c1c;
+      border-color: #c62828;
+    }
+    button:disabled {
+      background-color: #333;
+      color: #777;
+      border-color: #222;
+      cursor: not-allowed;
+    }
+    #video-feed, #capture-canvas {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Asistente Visual en Vivo</h1>
+
+  <div id="status" class="status-panel" role="status" aria-live="polite">
+    Estado: Desconectado.
+  </div>
+
+  <div class="field-group">
+    <label for="api-key">API Key de AI Studio:</label>
+    <input type="password" id="api-key" placeholder="Pega tu clave AIza..." autocomplete="off">
+  </div>
+
+  <div class="field-group">
+    <label for="model-select">Elegir modelo:</label>
+    <select id="model-select">
+      <option value="models/gemini-2.0-flash-exp" selected>Gemini 2.0 Flash (Recomendado / Tiempo real)</option>
+      <option value="models/gemini-2.0-flash">Gemini 2.0 Flash (Estable)</option>
+    </select>
+  </div>
+
+  <div class="field-group">
+    <label for="voice-select">Elegir voz del asistente:</label>
+    <select id="voice-select">
+      <option value="Aoede" selected>Aoede</option>
+      <option value="Charon">Charon</option>
+      <option value="Puck">Puck</option>
+      <option value="Kore">Kore</option>
+      <option value="Fenrir">Fenrir</option>
+    </select>
+  </div>
+
+  <button id="btn-start" aria-label="Iniciar transmisión en vivo">
+    Iniciar transmisión en vivo
+  </button>
+
+  <button id="btn-stop" aria-label="Detener transmisión" disabled>
+    Detener transmisión
+  </button>
+
+  <video id="video-feed" playsinline muted></video>
+  <canvas id="capture-canvas" width="640" height="480"></canvas>
+
+  <script>
+    const HOST = "generativelanguage.googleapis.com";
+    const SYSTEM_INSTRUCTION = "Actúa como un asistente de visión y orientación para una persona ciega. Sé directo, preciso y exhaustivo en los detalles espaciales (delante, a la izquierda, a la derecha, distancias aproximadas). Si hay textos, fechas o etiquetas enfrente, léelos con exactitud. No uses saludos ni introducciones conversacionales innecesarias.";
+
+    const apiKeyInput = document.getElementById("api-key");
+    const modelSelect = document.getElementById("model-select");
+    const voiceSelect = document.getElementById("voice-select");
+    const btnStart = document.getElementById("btn-start");
+    const btnStop = document.getElementById("btn-stop");
+    const statusBox = document.getElementById("status");
+    const video = document.getElementById("video-feed");
+    const canvas = document.getElementById("capture-canvas");
+    const ctx = canvas.getContext("2d");
+
+    let websocket = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let frameInterval = null;
+    let audioProcessor = null;
+    let nextAudioStartTime = 0;
+
+    // Recuperar preferencias guardadas
+    if (localStorage.getItem("ai_key")) apiKeyInput.value = localStorage.getItem("ai_key");
+    if (localStorage.getItem("ai_model")) modelSelect.value = localStorage.getItem("ai_model");
+    if (localStorage.getItem("ai_voice")) voiceSelect.value = localStorage.getItem("ai_voice");
+
+    function setStatus(text) {
+      statusBox.textContent = "Estado: " + text;
+    }
+
+    async function startSession() {
+      const apiKey = apiKeyInput.value.trim();
+      if (!apiKey) {
+        alert("Por favor, pega tu clave API de AI Studio.");
+        apiKeyInput.focus();
+        return;
+      }
+
+      localStorage.setItem("ai_key", apiKey);
+      localStorage.setItem("ai_model", modelSelect.value);
+      localStorage.setItem("ai_voice", voiceSelect.value);
+
+      setStatus("Solicitando permisos de cámara y micrófono...");
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+        });
+
+        video.srcObject = mediaStream;
+        await video.play();
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        if (audioContext.state === "suspended") {
+          await audioContext.resume();
+        }
+
+        setStatus("Conectando con el asistente...");
+
+        const url = `wss://${HOST}/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+        websocket = new WebSocket(url);
+
+        websocket.onopen = () => {
+          setStatus("En vivo. Puedes enfocar con la cámara y hablar.");
+          btnStart.disabled = true;
+          btnStop.disabled = false;
+
+          const setupMessage = {
+            setup: {
+              model: modelSelect.value,
+              generationConfig: {
+                responseModalities: ["AUDIO"],
+                temperature: 0.2,
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: {
+                      voiceName: voiceSelect.value
+                    }
+                  }
+                }
+              },
+              systemInstruction: {
+                parts: [{ text: SYSTEM_INSTRUCTION }]
+              }
+            }
+          };
+          websocket.send(JSON.stringify(setupMessage));
+
+          startAudioCapture();
+          startVideoTransmission();
+        };
+
+        websocket.onmessage = async (event) => {
+          let data;
+          if (event.data instanceof Blob) {
+            data = JSON.parse(await event.data.text());
+          } else {
+            data = JSON.parse(event.data);
+          }
+
+          if (data.serverContent && data.serverContent.modelTurn) {
+            const parts = data.serverContent.modelTurn.parts;
+            for (const part of parts) {
+              if (part.inlineData && part.inlineData.mimeType.startsWith("audio/pcm")) {
+                reproduceAudio(part.inlineData.data);
+              }
+            }
+          }
+        };
+
+        websocket.onerror = () => {
+          setStatus("Error en la conexión. Revisa tu clave API o internet.");
+          stopSession();
+        };
+
+        websocket.onclose = () => {
+          setStatus("Sesión finalizada.");
+          stopSession();
+        };
+
+      } catch (err) {
+        setStatus("Error: " + err.message);
+        stopSession();
+      }
+    }
+
+    function startAudioCapture() {
+      const inputContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const source = inputContext.createMediaStreamSource(mediaStream);
+      audioProcessor = inputContext.createScriptProcessor(4096, 1, 1);
+
+      audioProcessor.onaudioprocess = (e) => {
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        const pcm16 = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        let binary = "";
+        const bytes = new Uint8Array(pcm16.buffer);
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+
+        websocket.send(JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{
+              mimeType: "audio/pcm;rate=16000",
+              data: btoa(binary)
+            }]
+          }
+        }));
+      };
+
+      source.connect(audioProcessor);
+      audioProcessor.connect(inputContext.destination);
+    }
+
+    function startVideoTransmission() {
+      frameInterval = setInterval(() => {
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+        if (video.videoWidth === 0) return;
+
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const base64Image = canvas.toDataURL("image/jpeg", 0.6).split(",")[1];
+
+        websocket.send(JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{
+              mimeType: "image/jpeg",
+              data: base64Image
+            }]
+          }
+        }));
+      }, 1000);
+    }
+
+    function reproduceAudio(base64Data) {
+      if (!audioContext) return;
+
+      const binaryString = atob(base64Data);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      const int16Array = new Int16Array(bytes.buffer);
+      const float32Array = new Float32Array(int16Array.length);
+      for (let i = 0; i < int16Array.length; i++) {
+        float32Array[i] = int16Array[i] / 32768.0;
+      }
+
+      const audioBuffer = audioContext.createBuffer(1, float32Array.length, 24000);
+      audioBuffer.copyToChannel(float32Array, 0);
+
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContext.destination);
+
+      const currentTime = audioContext.currentTime;
+      if (nextAudioStartTime < currentTime) {
+        nextAudioStartTime = currentTime;
+      }
+      source.start(nextAudioStartTime);
+      nextAudioStartTime += audioBuffer.duration;
+    }
+
+    function stopSession() {
+      if (frameInterval) clearInterval(frameInterval);
+      if (audioProcessor) audioProcessor.disconnect();
+      if (websocket && websocket.readyState === WebSocket.OPEN) websocket.close();
+      if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+      if (audioContext && audioContext.state !== "closed") audioContext.close();
+
+      websocket = null;
+      audioContext = null;
+      mediaStream = null;
+      nextAudioStartTime = 0;
+
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      setStatus("Detenido.");
+    }
+
+    btnStart.addEventListener("click", startSession);
+    btnStop.addEventListener("click", stopSession);
+  </script>
+</body>
+</html>
